@@ -140,17 +140,29 @@ def reduce_url_list(urls):
     return unique_urls
 
 
+# @contextlib.contextmanager
+# def database_cursor(**connect_params):
+#     database = MySQLdb.connect(**connect_params)
+#     log.debug("Connected to database.")
+#     database.autocommit(True) # needed if you're using InnoDB
+#     cursor = database.cursor()
+#     cursor.execute('SET NAMES UTF8')
+#     yield cursor
+#     cursor.close()
+#     database.close()
+#     log.debug("Disconnected from database.")
+
 @contextlib.contextmanager
-def database_cursor(**connect_params):
-    database = MySQLdb.connect(**connect_params)
-    log.debug("Connected to database.")
-    database.autocommit(True) # needed if you're using InnoDB
-    cursor = database.cursor()
-    cursor.execute('SET NAMES UTF8')
-    yield cursor
-    cursor.close()
-    database.close()
-    log.debug("Disconnected from database.")
+def elasticsearch_client():
+    es = elasticsearch.Elasticsearch(
+        [self.config.get('elasticsearch', 'host')],
+        # http_auth=('user', 'secret'),
+        port=self.config.get('elasticsearch', 'port'),
+        # use_ssl=False,
+        # verify_certs=True,
+        # ca_certs=certifi.where(),
+    )
+    yield es
 
 
 class TweetEntityWorker(object):
@@ -158,15 +170,15 @@ class TweetEntityWorker(object):
         super(TweetEntityWorker, self).__init__()
         self.heart = heart
         self.config = tweetsclient.Config().get()
-        self.db_connect_params = {
-            'host': self.config.get('database', 'host'),
-            'port': int(self.config.get('database', 'port')),
-            'db': self.config.get('database', 'database'),
-            'user': self.config.get('database', 'username'),
-            'passwd': self.config.get('database', 'password'),
-            'charset': "utf8",
-            'use_unicode': True
-        }
+        # self.db_connect_params = {
+        #     'host': self.config.get('database', 'host'),
+        #     'port': int(self.config.get('database', 'port')),
+        #     'db': self.config.get('database', 'database'),
+        #     'user': self.config.get('database', 'username'),
+        #     'passwd': self.config.get('database', 'password'),
+        #     'charset': "utf8",
+        #     'use_unicode': True
+        # }
 
     def run(self):
         mimetypes.init()
@@ -236,10 +248,18 @@ class TweetEntityWorker(object):
                 break
 
     def record_tweet_image(self, tweet, url):
-        with database_cursor(**self.db_connect_params) as cursor:
-            cursor.execute("""INSERT INTO `tweet_images` (`tweet_id`, `url`, `created_at`, `updated_at`) VALUES(%s, %s, NOW(), NOW())""", (tweet['id'], url))
+        # with database_cursor(**self.db_connect_params) as cursor:
+        #     cursor.execute("""INSERT INTO `tweet_images` (`tweet_id`, `url`, `created_at`, `updated_at`) VALUES(%s, %s, NOW(), NOW())""", (tweet['id'], url))
+        #     log.info("Inserted image into database for tweet {tweet}: {url}",
+        #               tweet=tweet.get('id'), url=url)
+        with elasticsearch_client() as es_client:
+            daily_worker_id = 'twitter' + tweet['id']
+            es.update(self.config.get('elasticsearch', 'index'), 'tweet', daily_worker_id, {
+                screenshot_url: url
+            })
             log.info("Inserted image into database for tweet {tweet}: {url}",
                       tweet=tweet.get('id'), url=url)
+
 
 
     def screenshot_entity_url(self, tweet, entity_index, url):

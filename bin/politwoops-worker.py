@@ -27,8 +27,8 @@ socket._fileobject.default_bufsize = 0
 import httplib
 httplib.HTTPConnection.debuglevel = 1
 
-import urllib2
-import MySQLdb
+import urllib3
+import elasticsearch
 import anyjson
 import logbook
 import tweetsclient
@@ -65,6 +65,16 @@ class DeletedTweetsWorker(object):
         self.database.autocommit(True) # needed if you're using InnoDB
         self.database.cursor().execute('SET NAMES UTF8')
 
+    def init_elasticsearch(self):
+        self.es = elasticsearch.Elasticsearch(
+            [self.config.get('elasticsearch', 'host')],
+            # http_auth=('user', 'secret'),
+            port=self.config.get('elasticsearch', 'port'),
+            # use_ssl=False,
+            # verify_certs=True,
+            # ca_certs=certifi.where(),
+        )
+
     def init_beanstalk(self):
         tweets_tube = self.config.get('beanstalk', 'tweets_tube')
         screenshot_tube = self.config.get('beanstalk', 'screenshot_tube')
@@ -78,6 +88,22 @@ class DeletedTweetsWorker(object):
                                                     watch=tweets_tube,
                                                     use=screenshot_tube)
 
+    # TODO: move to shared/utils file
+    def load_plugin(self, plugin_module, plugin_class):
+        pluginModule = __import__(plugin_module)
+        components = plugin_module.split('.')
+        for comp in components[1:]:
+            pluginModule = getattr(pluginModule, comp)
+        pluginClass = getattr(pluginModule, plugin_class)
+        return pluginClass
+    def get_config_default(self, section, key, default = None):
+        try:
+            return self.config.get(section, key)
+        except ConfigParser.NoOptionError:
+            return default
+
+
+
     def _database_keepalive(self):
         cur = self.database.cursor()
         cur.execute("""SELECT id FROM tweets LIMIT 1""")
@@ -90,28 +116,43 @@ class DeletedTweetsWorker(object):
         self.config = tweetsclient.Config().get()
 
     def get_users(self):
-        cursor = self.database.cursor()
-        q = "SELECT `twitter_id`, `user_name`, `id` FROM `politicians`"
-        cursor.execute(q)
+        track_module = self.get_config_default('tweets-client', 'track-module', 'tweetsclient.config_track')
+        track_class = self.get_config_default('tweets-client', 'track-class', 'ConfigTrackPlugin')
+
+        pluginClass = self.load_plugin(track_module, track_class)
+        self.track = pluginClass()
+        users_to_track = self.track.get_items()
         ids = {}
         politicians = {}
-        for t in cursor.fetchall():
-            ids[t[0]] = t[2]
-            politicians[t[0]] = t[1]
+
+        for user in users_to_track:
+            ids[int(user["id"])] = int(user["id"]) # coping with the original politwoops architecture
+            ids[int(user["id"])] = user["handle"]
+
+        # cursor = self.database.cursor()
+        # q = "SELECT `twitter_id`, `user_name`, `id` FROM `politicians`"
+        # cursor.execute(q)
+        # ids = {}
+        # politicians = {}
+        # for t in cursor.fetchall():
+        #     ids[t[0]] = t[2]
+        #     politicians[t[0]] = t[1]
+
         log.info("Found ids: {ids}", ids=ids)
         log.info("Found politicians: {politicians}", politicians=politicians)
         return ids, politicians
 
     def run(self):
         mimetypes.init()
-        self.init_database()
+        self.init_elasticsearch()
         self.init_beanstalk()
         self.users, self.politicians = self.get_users()
 
         while True:
             time.sleep(0.2)
             if self.heart.beat():
-                self._database_keepalive()
+                pass
+            #     # self._database_keepalive()
             reserve_timeout = max(self.heart.interval.total_seconds() * 0.1, 2)
             job = self.beanstalk.reserve(timeout=reserve_timeout)
             if job:
@@ -135,18 +176,47 @@ class DeletedTweetsWorker(object):
 
     def handle_deletion(self, tweet):
         log.notice("Deleted tweet {0}", tweet['delete']['status']['id'])
-        cursor = self.database.cursor()
-        cursor.execute("""SELECT COUNT(*) FROM `tweets` WHERE `id` = %s""", (tweet['delete']['status']['id'],))
-        num_previous = cursor.fetchone()[0]
-        if num_previous > 0:
-            cursor.execute("""UPDATE `tweets` SET `modified` = NOW(), `deleted` = 1 WHERE id = %s""", (tweet['delete']['status']['id'],))
-        else:
-            cursor.execute("""REPLACE INTO `tweets` (`id`, `deleted`, `modified`, `created`) VALUES(%s, 1, NOW(), NOW())""", (tweet['delete']['status']['id']))
-        self.copy_tweet_to_deleted_table(tweet['delete']['status']['id'])
+        # cursor = self.database.cursor()
+        # cursor.execute("""SELECT COUNT(*) FROM `tweets` WHERE `id` = %s""", (tweet['delete']['status']['id'],))
+        # num_previous = cursor.fetchone()[0]
+        res = self.es.search(index=self.config.get('elasticsearch', 'index'), 
+                             body={"query": {"term": {"platform_id":  tweet['delete']['status']['id']  }}} )
+        num_previous = res["hits"]["total"]
 
-        cursor.execute("""SELECT * FROM `tweets` WHERE `id` = %s""", (tweet['delete']['status']['id'],))
-        ref_tweet = cursor.fetchone()
-        self.send_alert(ref_tweet[1], ref_tweet[4], ref_tweet[2])
+        daily_worker_id = 'twitter' + str(tweet['delete']['status']['id'])
+
+
+        if num_previous > 0:
+            self.es.update(self.config.get('elasticsearch', 'index'), 'tweet', daily_worker_id, {
+                        "doc": {"deleted": True}
+                })
+        else:
+            print(tweet)
+            self.es.index(self.config.get('elasticsearch', 'index'), 'tweet', {
+                        "platform": 'twitter',
+                        "dw_source": 'politwoops',
+                        "body":     replace_highpoints(tweet['text']),
+                        "candidate_name": 'TK', # how is this going to access the instance var @screen_names above???
+                        "created_at": tweet["created_at"],
+                        "platform_id": tweet['delete']['status']['id'],
+                        "id": 'twitter' + str(tweet['id']),
+                        "_id": 'twitter' + str(tweet['id']),
+                        
+                        "link": "http://twitter.com/" + tweet['user']['screen_name'] + '/status/' + str(tweet['id']),
+                        "deleted": True, 
+                        "geo": tweet['coordinates'],
+                        "platform_username": tweet['user']['screen_name'],
+                        "platform_displayname": tweet['user']['name'],
+                        "platform_userid": tweet['user']['id'],
+                        "favorite_count": tweet['favorite_count'],
+                        "retweet_count": tweet['retweet_count'],
+                        "source": str(tweet['source']).replace("<a href=\"http://twitter.com\" rel=\"nofollow\">", '').replace("</a>", '')
+                }, daily_worker_id)
+        res = self.es.search(index=self.config.get('elasticsearch', 'index'), body={"query": {"term": {"platform_id":  tweet['delete']['status']['id']  }}} )
+
+        # cursor.execute("""SELECT * FROM `tweets` WHERE `id` = %s""", (tweet['delete']['status']['id'],))
+        ref_tweet = res['hits']['hits'][0]
+        # self.send_alert(ref_tweet[1], ref_tweet[4], ref_tweet[2])
 
     def handle_new(self, tweet):
         log.notice("New tweet {tweet} from user {user_id}/{screen_name}",
@@ -155,13 +225,13 @@ class DeletedTweetsWorker(object):
                   screen_name=tweet.get('user', {}).get('screen_name'))
 
         self.handle_possible_rename(tweet)
-        cursor = self.database.cursor()
-        cursor.execute("""SELECT COUNT(*), `deleted` FROM `tweets` WHERE `id` = %s""", (tweet['id'],))
 
-        info = cursor.fetchone()
-        num_previous = info[0]
-        if info[1] is not None:
-            was_deleted = (int(info[1]) == 1)
+        res = self.es.search(index=self.config.get('elasticsearch', 'index'), 
+                             body={"query": {"term": {"platform_id":  tweet['id']  }}} )
+
+        num_previous = res["hits"]["total"]
+        if len(res["hits"]["hits"]) > 0:
+            was_deleted = (res["hits"]["hits"][0]["deleted"] == True)
         else:
             was_deleted = False
         # cursor.execute("""SELECT COUNT(*) FROM `tweets`""")
@@ -176,27 +246,56 @@ class DeletedTweetsWorker(object):
             retweeted_content = replace_highpoints(tweet['retweeted_status']['text'])
             retweeted_user_name = tweet['retweeted_status']['user']['screen_name']
 
+        daily_worker_id = 'twitter' + str(tweet['id'])
+
         if num_previous > 0:
-            cursor.execute("""UPDATE `tweets` SET `user_name` = %s, `politician_id` = %s, `content` = %s, `tweet`=%s, `retweeted_id`=%s, `retweeted_content`=%s, `retweeted_user_name`=%s, `modified`= NOW() WHERE id = %s""",
-                           (tweet['user']['screen_name'],
-                            self.users[tweet['user']['id']],
-                            replace_highpoints(tweet['text']),
-                            anyjson.serialize(tweet),
-                            retweeted_id,
-                            retweeted_content,
-                            retweeted_user_name,
-                            tweet['id']))
+            self.es.update(self.config.get('elasticsearch', 'index'), 'tweet', daily_worker_id, {
+                        "platform": 'twitter',
+                        "dw_source": 'politwoops',
+                        "body":     replace_highpoints(tweet['text']),
+                        "candidate_name": 'TK', # how is this going to access the instance var @screen_names above???
+                        "created_at": tweet["created_at"],
+                        "platform_id": tweet['id'],
+                        "id": 'twitter' + str(tweet['id']),
+                        "_id": 'twitter' + str(tweet['id']),
+                        
+                        "link": "http://twitter.com/" + tweet['user']['screen_name'] + '/status/' + str(tweet['id']),
+                        "deleted": False, 
+                        "geo": tweet['coordinates'],
+                        "platform_username": tweet['user']['screen_name'],
+                        "platform_displayname": tweet['user']['name'],
+                        "platform_userid": tweet['user']['id'],
+                        "favorite_count": tweet['favorite_count'],
+                        "retweet_count": tweet['retweet_count'],
+                        "source": str(tweet['source']).replace("<a href=\"http://twitter.com\" rel=\"nofollow\">", '').replace("</a>", '')
+                })
+
+            # index – The name of the index
+            # doc_type – The type of the document
+            # id – Document ID
+            # body – The request definition using either script or partial doc
             log.info("Updated tweet {0}", tweet.get('id'))
         else:
-            cursor.execute("""INSERT INTO `tweets` (`id`, `user_name`, `politician_id`, `content`, `created`, `modified`, `tweet`, retweeted_id, retweeted_content, retweeted_user_name) VALUES(%s, %s, %s, %s, NOW(), NOW(), %s, %s, %s, %s)""",
-                           (tweet['id'],
-                            tweet['user']['screen_name'],
-                            self.users[tweet['user']['id']],
-                            replace_highpoints(tweet['text']),
-                            anyjson.serialize(tweet),
-                            retweeted_id,
-                            retweeted_content,
-                            retweeted_user_name))
+            self.es.index(self.config.get('elasticsearch', 'index'), 'tweet', {
+                        "platform": 'twitter',
+                        "dw_source": 'politwoops',
+                        "body":     replace_highpoints(tweet['text']),
+                        "candidate_name": 'TK', # how is this going to access the instance var @screen_names above???
+                        "created_at": tweet["created_at"],
+                        "platform_id": tweet['id'],
+                        "id": 'twitter' + str(tweet['id']),
+                        "_id": 'twitter' + str(tweet['id']),
+                        
+                        "link": "http://twitter.com/" + tweet['user']['screen_name'] + '/status/' + str(tweet['id']),
+                        "deleted": was_deleted, 
+                        "geo": tweet['coordinates'],
+                        "platform_username": tweet['user']['screen_name'],
+                        "platform_displayname": tweet['user']['name'],
+                        "platform_userid": tweet['user']['id'],
+                        "favorite_count": tweet['favorite_count'],
+                        "retweet_count": tweet['retweet_count'],
+                        "source": str(tweet['source']).replace("<a href=\"http://twitter.com\" rel=\"nofollow\">", '').replace("</a>", '')
+                }, daily_worker_id)
             log.info("Inserted new tweet {0}", tweet.get('id'))
 
 
@@ -205,20 +304,23 @@ class DeletedTweetsWorker(object):
             self.copy_tweet_to_deleted_table(tweet['id'])
 
     def copy_tweet_to_deleted_table(self, tweet_id):
-        cursor = self.database.cursor()
-        cursor.execute("""REPLACE INTO `deleted_tweets` SELECT * FROM `tweets` WHERE `id` = %s AND `content` IS NOT NULL""" % (tweet_id))
+        # cursor = self.database.cursor()
+        # cursor.execute("""REPLACE INTO `deleted_tweets` SELECT * FROM `tweets` WHERE `id` = %s AND `content` IS NOT NULL""" % (tweet_id))
+        return
 
     def handle_possible_rename(self, tweet):
-        tweet_user_name = tweet['user']['screen_name']
-        tweet_user_id = tweet['user']['id']
-        current_user_name = self.politicians[tweet_user_id]
-        if current_user_name != tweet_user_name:
-            self.politicians[tweet_user_id] = tweet_user_name
-            cursor= self.database.cursor()
-            cursor.execute("""UPDATE `politicians` SET `user_name` = %s WHERE `id` = %s""", (tweet_user_name, self.users[tweet_user_id]))
+        return
+        # tweet_user_name = tweet['user']['screen_name']
+        # tweet_user_id = tweet['user']['id']
+        # current_user_name = self.politicians[tweet_user_id]
+        # if current_user_name != tweet_user_name:
+        #     self.politicians[tweet_user_id] = tweet_user_name
+        #     cursor= self.database.cursor()
+        #     cursor.execute("""UPDATE `politicians` SET `user_name` = %s WHERE `id` = %s""", (tweet_user_name, self.users[tweet_user_id]))
 
 
     def send_alert(self, username, created, text):
+        return
         if username and self.config.has_section('moderation-alerts'):
             host = self.config.get('moderation-alerts', 'mail_host')
             port = self.config.get('moderation-alerts', 'mail_port')

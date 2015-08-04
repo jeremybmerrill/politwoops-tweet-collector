@@ -142,13 +142,18 @@ class TweetStreamClient(object):
         self.track = pluginClass()
         stream_type = self.track.get_type()
         log.debug("Initializing a {0} stream of tweets.", stream_type)
-        track_items = self.track.get_items()
+        track_items = [user["id"] for user in self.track.get_items()]
         log.debug(str(track_items))
 
         stream = None
         if stream_type == 'users':
             tweet_listener = TweetListener(self.beanstalk)
             stream = tweepy.Stream(self.twitter_auth, tweet_listener)
+            # Tweets created by the user.
+            # Tweets which are retweeted by the user.
+            # Replies to any Tweet created by the user.
+            # Retweets of any Tweet created by the user.
+            # Manual replies, created without pressing a reply button (e.g. “@twitterapi I agree”).        
             stream.filter(follow=track_items)
         elif stream_type == 'words':
             raise Exception('The words stream type is no longer supported.')
